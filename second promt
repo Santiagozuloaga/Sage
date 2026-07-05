@@ -1,0 +1,35 @@
+A Kimi (Verification Engineer)
+Objetivo
+
+Validar técnicamente los reclamos realizados por Runtime Engineer.
+
+Alcance
+
+No revisar las 61 pruebas.
+
+Seleccionar una muestra representativa.
+
+Verificar:
+
+bugs reproducidos
+fixes
+pruebas
+regresiones
+Restricciones
+
+No modificar código.
+
+No participar en la integración.
+
+No revisar arquitectura.
+
+Entregable
+
+VERIFICATION_REPORT.md
+
+Para cada prueba:
+
+PASA
+FALLA
+evidencia
+observaciones
