@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAGE OS v4.5 - Engineering Operating System</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>SAGE ENGINEERING OS</h1>
+            <div class="header-info">
+                <span id="session-id">Loading...</span>
+                <span id="uptime">Uptime: --</span>
+            </div>
+        </header>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="label">Kernel</span>
+                <span id="kernel-status" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">State</span>
+                <span id="kernel-state" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Memory</span>
+                <span id="memory-status" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Event Bus</span>
+                <span id="eventbus-status" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Dispatcher</span>
+                <span id="dispatcher-status" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Mission Control</span>
+                <span id="mission-status" class="status-value">--</span>
+            </div>
+            <div class="status-item">
+                <span class="label">Dashboard</span>
+                <span id="dashboard-status" class="status-value">--</span>
+            </div>
+        </div>
+
+        <!-- Main Content Grid -->
+        <div class="main-grid">
+            <!-- Command Console -->
+            <div class="panel command-panel">
+                <div class="panel-header">
+                    <h2>Command Console</h2>
+                </div>
+                <div class="panel-body">
+                    <div class="command-input">
+                        <input type="text" id="command-input" placeholder="Enter command..." autocomplete="off">
+                        <button id="execute-btn">Execute</button>
+                    </div>
+                    <div class="console-output" id="console-output">
+                        <div class="console-line system">SAGE OS v4.5 Runtime Ready</div>
+                        <div class="console-line system">Type 'help' for available commands</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Agents Panel -->
+            <div class="panel agents-panel">
+                <div class="panel-header">
+                    <h2>Agents</h2>
+                </div>
+                <div class="panel-body">
+                    <div id="agents-list" class="agents-list">
+                        <div class="loading">Loading agents...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dashboard Panel -->
+            <div class="panel dashboard-panel">
+                <div class="panel-header">
+                    <h2>Dashboard</h2>
+                </div>
+                <div class="panel-body">
+                    <div class="dashboard-metrics">
+                        <div class="metric">
+                            <span class="metric-label">CPU</span>
+                            <span id="metric-cpu" class="metric-value">--</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Memory</span>
+                            <span id="metric-memory" class="metric-value">--</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Tasks</span>
+                            <span id="metric-tasks" class="metric-value">--</span>
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Errors</span>
+                            <span id="metric-errors" class="metric-value">--</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Event Log Panel -->
+            <div class="panel events-panel">
+                <div class="panel-header">
+                    <h2>Event Log</h2>
+                </div>
+                <div class="panel-body">
+                    <div id="events-log" class="events-log">
+                        <div class="loading">Loading events...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Memory Panel -->
+            <div class="panel memory-panel">
+                <div class="panel-header">
+                    <h2>Engineering Memory</h2>
+                </div>
+                <div class="panel-body">
+                    <div id="memory-list" class="memory-list">
+                        <div class="loading">Loading memory...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Mission Control Panel -->
+            <div class="panel mission-panel">
+                <div class="panel-header">
+                    <h2>Mission Control</h2>
+                </div>
+                <div class="panel-body">
+                    <div id="mission-list" class="mission-list">
+                        <div class="loading">Loading missions...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
