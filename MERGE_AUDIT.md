@@ -25,7 +25,6 @@ Se compararon **18 archivos** entre las dos ramas más el baseline. El resultado
 |---|---|
 | Archivos modificados por Claude A solamente | 7 ( + 1 nuevo: `providers/ollama_provider.py`) |
 | Archivos modificados por Runtime Engineer solamente | 6 |
-| Archivos modificados por Kimi (Decision Engine) | 4 (`dispatcher/engine.py`, `agents/router.py`, `kernel/state.py`, `kernel/core.py` wiring) |
 | Archivos modificados por AMBAS ramas (conflicto a nivel archivo) | 2 (`kernel/core.py`, `main.py`) |
 | Conflictos puntuales identificados (a nivel método/línea) | **10** |
 | Conflictos de integración cruzada (entre archivos distintos) | **6** |
@@ -36,15 +35,6 @@ Se compararon **18 archivos** entre las dos ramas más el baseline. El resultado
 **Hallazgo más severo:** la rama Runtime Engineer se construyó sobre el baseline (`sage_runtime.zip`) **sin incluir los fixes de Claude A**. Esto significa que fusionar `sage_runtime_fixed/` (RE) sobre `cascade_pkg/sage_runtime_handoff/sage_runtime_fixed/` (Claude A) **perdería los 8 fixes de Claude A** en `kernel/core.py`, `config/manager.py`, `memory/engine.py`, `dispatcher/engine.py`, `providers/provider_router.py`, `providers/ollama_provider.py`, `main.py`, `repository_scanner/dependency_graph.py`. La dirección de fusión correcta es **Claude A como base + RE aplicado encima**, no al revés.
 
 **Hallazgo crítico de integración:** el `_init_dashboard()` que el Runtime Engineer asume presente en `kernel/core.py` (línea 117 de su versión) **fue eliminado por Claude A** (líneas 192-198 del diff). El fallback defensivo de RE en `main.py` (líneas 82-88) cubre este caso, pero el resultado neto es que el dashboard pasa a ser responsabilidad de `main.py`, no del kernel — un cambio de diseño que requiere confirmación humana explícita.
-
-**Hallazgo sobre Kimi:** Kimi identificó y fixeó 12 bugs reales en su área de especialización (D-1 a D-7 en dispatcher, A-1 a A-3 en router, S-1 y S-2 portados desde RE). Los 40 tests de regresión pasan completamente. Kimi preservó el wiring de Claude A (_init_optional, dispatcher→provider_router, _degraded tracking). Sin embargo, Kimi NO aplicó K-7 y K-8 (shutdown aislado e idempotente) del Runtime Engineer — esto constituye una omisión funcional que debe resolverse antes de integración final. **VERIFICACIÓN ADICIONAL (Qwen):** Se ejecutaron los 40 tests de Kimi exitosamente (40/40 PASS). Se confirmó que la versión de Claude A (HANDOFF_CASCADE_PAQUETE) tiene _degraded, set_provider_router wiring, y record_error en execute_command, pero NO tiene el shutdown aislado/idempotente de RE. La versión de Kimi es un subconjunto de Claude A + fixes de dispatcher/router + S-1/S-2, pero sin K-7/K-8.
-
-**Estado actual de validación:**
-- Claude A: 15 fixes documentados, 5/6 tests PASS (1 depende de fastapi)
-- Runtime Engineer: 14 fixes documentados, 61/61 tests PASS ✅ VERIFICADO
-- Kimi: 12 fixes documentados, 40/40 tests PASS ✅ VERIFICADO
-- GLM: Audit de merge completado, 10 conflictos identificados, 4 requieren decisión humana
-- Qwen: Auditoría completada, verificación empírica de tests RE y Kimi, confirmación de omisión K-7/K-8 en Kimi
 
 ---
 
