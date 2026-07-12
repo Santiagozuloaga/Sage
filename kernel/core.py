@@ -118,6 +118,11 @@ class SageKernel:
             dispatcher.set_provider_router(provider_router)
             logger.info("[BOOT] Wired dispatcher -> provider_router")
 
+        # Wire dispatcher to agent_router for load balancing
+        agent_router = self._components.get("agent_router")
+        if dispatcher is not None and agent_router is not None:
+            dispatcher.set_agent_router(agent_router)
+            logger.info("[BOOT] Wired dispatcher -> agent_router")
         if self._degraded:
             logger.warning(
                 f"[BOOT] Completed in DEGRADED mode — unavailable components: "

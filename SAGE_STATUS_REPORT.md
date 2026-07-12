@@ -289,7 +289,7 @@ git merge fix/kimi-decision-engine --no-ff -m "Merge Kimi Decision Engine (40 te
 3. ✅ 101 tests ya validados
 4. ✅ Documentación completa generada
 
-**Recomendación:** Proceder con merges en el orden especificado. El riesgo técnico es mínimo; el único riesgo real es la demora en decisiones humanas.
+**Recomendacaón:** Proceder con merges en el orden especificado. El riesgo técnico es mínimo; el único riesgo real es la demora en decisiones humanas.
 
 ---
 
