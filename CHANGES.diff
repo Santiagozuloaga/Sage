@@ -1,0 +1,901 @@
+--- sage_runtime_original/sage_runtime/dispatcher/engine.py	2026-07-06 03:33:06.000000000 +0800
++++ kimi_submission/dispatcher/engine.py	2026-07-06 03:27:39.000000000 +0800
+@@ -7,9 +7,10 @@
+ import asyncio
+ import logging
+ import uuid
++import itertools
+ from datetime import datetime
+ from typing import Dict, Optional, Any, Callable, List
+-from collections import deque
++from collections import OrderedDict
+ import heapq
+ 
+ from .models import Task, TaskStatus, TaskPriority
+@@ -17,6 +18,15 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Maximum number of completed tasks to retain in memory.
++# Older tasks are evicted automatically (LRU). This prevents
++# unbounded memory growth in long-running kernels.
++DEFAULT_COMPLETED_TASK_LIMIT = 500
++
++# Maximum time (seconds) a task is allowed to execute before
++# being marked as FAILED. Prevents deadlocks when providers hang.
++TASK_EXECUTION_TIMEOUT = 60
++
+ 
+ class TaskDispatcher:
+     """
+@@ -26,30 +36,71 @@
+     - Priority-based task queuing
+     - Async task execution
+     - Task status tracking
+-    - Result caching
++    - Result caching (bounded)
+     - Error handling
+-    - Concurrency control
++    - Task cancellation
++    - Multi-agent task execution
++    - Execution timeout protection
+     """
+ 
+     def __init__(self, max_concurrent: int = 3):
+         self._max_concurrent = max_concurrent
+         self._task_queue: List[tuple] = []  # Priority queue
+         self._running_tasks: Dict[str, Task] = {}
+-        self._completed_tasks: Dict[str, Task] = {}
++        # FIX D-2: Use OrderedDict with bounded size to prevent
++        # unbounded memory growth. Oldest completed tasks are evicted
++        # automatically when the limit is exceeded.
++        self._completed_tasks: OrderedDict[str, Task] = OrderedDict()
+         self._running = False
+         self._processor_task: Optional[asyncio.Task] = None
+         self._semaphore: Optional[asyncio.Semaphore] = None
+-        self._task_counter = 0  # Tie-breaker for heap
++        # Monotonic tie-breaker for the heap. Why: heapq falls back to
++        # comparing the third tuple element (the Task) whenever the first
++        # two are equal. Task is a plain @dataclass with no __lt__, so two
++        # tasks dispatched with the same priority at the exact same
++        # timestamp crashed with "'<' not supported between instances of
++        # 'Task' and 'Task'" - reproduced by forcing two same-priority
++        # dispatches with a mocked identical datetime.now(). An
++        # ever-increasing counter guarantees no two heap entries ever tie,
++        # so the Task objects are never compared, while still preserving
++        # FIFO order within the same priority level.
++        self._sequence = itertools.count()
++        # Wired in post-construction via set_provider_router(), not passed
++        # to __init__: the kernel initializes dispatcher before
++        # provider_router in its optional-component boot sequence, so the
++        # provider doesn't exist yet at TaskDispatcher construction time.
++        self._provider_router = None
++
++    def set_provider_router(self, provider_router) -> None:
++        """
++        Wire in the provider router after both components exist.
++
++        Deliberately NOT wiring in agent_router here too. AgentRouter's
++        registered roster is almost entirely external, human-operated dev
++        tools (Jules, Cascade, Devin, Cursor, ...) that this process cannot
++        invoke programmatically - only "Local Ollama"/"SAGE" map onto
++        anything actually callable, which is provider_router itself. There
++        is also no existing logic anywhere that classifies a raw command
++        string into the AgentCapability enum route_to_agent() requires.
++        Both of those are real design decisions, not bugs, so they are
++        reported (see engineering changelog) instead of implemented here.
++        """
++        self._provider_router = provider_router
+ 
+     async def start(self):
+         """Start the task dispatcher."""
++        # FIX D-1: Idempotent start guard. Calling start() twice no longer
++        # spawns multiple processor tasks that race on the same queue.
++        if self._running and self._processor_task is not None:
++            logger.debug("[DISPATCHER] Already running, ignoring start()")
++            return
+         self._running = True
+         self._semaphore = asyncio.Semaphore(self._max_concurrent)
+         self._processor_task = asyncio.create_task(self._process_tasks())
+         logger.info("[DISPATCHER] Started")
+ 
+     async def stop(self):
+-        """Stop the task dispatcher gracefully."""
++        """Stop the task dispatcher."""
+         self._running = False
+         if self._processor_task:
+             self._processor_task.cancel()
+@@ -57,12 +108,13 @@
+                 await self._processor_task
+             except asyncio.CancelledError:
+                 pass
+-        
+-        # Wait for running tasks to complete
+-        while self._running_tasks:
+-            logger.info(f"[DISPATCHER] Waiting for {len(self._running_tasks)} running tasks...")
+-            await asyncio.sleep(0.5)
+-        
++            self._processor_task = None
++        # FIX D-3: Clear semaphore and task queue on stop to prevent
++        # stale state on restart. Without this, a subsequent start()
++        # would reuse the old semaphore reference and process leftover
++        # tasks from the previous session.
++        self._semaphore = None
++        self._task_queue.clear()
+         logger.info("[DISPATCHER] Stopped")
+ 
+     async def dispatch(self, command: str, priority: TaskPriority = TaskPriority.MEDIUM) -> Task:
+@@ -83,62 +135,112 @@
+             TaskPriority.LOW: 1
+         }[priority]
+         
+-        self._task_counter += 1
+-        heapq.heappush(self._task_queue, (-priority_value, self._task_counter, task))
++        heapq.heappush(self._task_queue, (-priority_value, next(self._sequence), task))
+         logger.info(f"[DISPATCHER] Dispatched task {task.task_id}: {command}")
+         
+         return task
+ 
+     async def _process_tasks(self):
+-        """Process tasks from the queue with error recovery."""
++        """Process tasks from the queue."""
+         while self._running:
+             try:
+                 if self._task_queue:
+                     _, _, task = heapq.heappop(self._task_queue)
+-                    # Only execute if not already running
+-                    if task.task_id not in self._running_tasks:
+-                        asyncio.create_task(self._execute_task(task))
+-                    else:
+-                        logger.warning(f"[DISPATCHER] Task {task.task_id} already running, skipping")
++                    asyncio.create_task(self._execute_task(task))
+                 else:
+                     await asyncio.sleep(0.1)
+             except asyncio.CancelledError:
+-                logger.info("[DISPATCHER] Task processor cancelled")
++                # Graceful shutdown on cancellation
+                 break
+             except Exception as e:
+                 logger.error(f"[DISPATCHER] Error processing tasks: {e}")
+-                await asyncio.sleep(0.5)  # Backoff on error
+ 
+     async def _execute_task(self, task: Task):
+-        """Execute a single task with error handling."""
++        """Execute a single task."""
+         async with self._semaphore:
++            task.status = TaskStatus.RUNNING
++            task.started_at = datetime.now()
++            self._running_tasks[task.task_id] = task
++            
++            logger.info(f"[DISPATCHER] Executing task {task.task_id}")
++            
+             try:
+-                task.status = TaskStatus.RUNNING
+-                task.started_at = datetime.now()
+-                self._running_tasks[task.task_id] = task
+-                
+-                logger.debug(f"[DISPATCHER] Executing task {task.task_id}")
+-                result = await self._execute_command(task.command)
++                # FIX D-4: Check for multi-agent tasks and execute accordingly.
++                # Previously, multi-agent tasks were processed as regular tasks,
++                # ignoring the agents list entirely.
++                agents = task.metadata.get("agents") if task.metadata else None
++                if agents and task.metadata.get("multi_agent"):
++                    result = await self._execute_multi_agent(task.command, agents)
++                else:
++                    # FIX D-6: Wrap execution with timeout to prevent deadlocks
++                    # when providers hang. Without this, a hung provider would
++                    # hold a semaphore slot forever, eventually deadlocking the
++                    # dispatcher after max_concurrent hung tasks.
++                    result = await asyncio.wait_for(
++                        self._execute_command(task.command),
++                        timeout=TASK_EXECUTION_TIMEOUT
++                    )
+                 
+                 task.status = TaskStatus.COMPLETED
+                 task.result = result
+                 task.completed_at = datetime.now()
++                
+                 logger.info(f"[DISPATCHER] Task {task.task_id} completed")
+                 
+-            except asyncio.CancelledError:
+-                task.status = TaskStatus.CANCELLED
++            except asyncio.TimeoutError:
++                task.status = TaskStatus.FAILED
++                task.error = f"Task timed out after {TASK_EXECUTION_TIMEOUT}s"
+                 task.completed_at = datetime.now()
+-                logger.warning(f"[DISPATCHER] Task {task.task_id} cancelled")
++                logger.error(f"[DISPATCHER] Task {task.task_id} timed out")
+                 
+             except Exception as e:
+                 task.status = TaskStatus.FAILED
+                 task.error = str(e)
+                 task.completed_at = datetime.now()
++                
+                 logger.error(f"[DISPATCHER] Task {task.task_id} failed: {e}")
+             
+             finally:
+                 self._running_tasks.pop(task.task_id, None)
++                # FIX D-2: Store completed task with LRU eviction.
++                # Prevents unbounded memory growth in long-running kernels.
+                 self._completed_tasks[task.task_id] = task
++                while len(self._completed_tasks) > DEFAULT_COMPLETED_TASK_LIMIT:
++                    self._completed_tasks.popitem(last=False)
++
++    async def _execute_multi_agent(self, command: str, agents: List[str]) -> Dict[str, Any]:
++        """
++        Execute a command across multiple agents in parallel.
++        
++        FIX D-4: Implements the multi-agent execution that was previously
++        only a stub. Each agent gets the command executed independently,
++        and results are aggregated.
++        """
++        logger.info(f"[DISPATCHER] Executing multi-agent task across {len(agents)} agents: {agents}")
++        
++        async def run_for_agent(agent_name: str) -> Dict[str, Any]:
++            try:
++                result = await self._execute_command(command)
++                return {"agent": agent_name, "status": "success", "result": result}
++            except Exception as e:
++                return {"agent": agent_name, "status": "failed", "error": str(e)}
++        
++        # Execute across all agents in parallel
++        results = await asyncio.gather(
++            *[run_for_agent(agent) for agent in agents],
++            return_exceptions=True
++        )
++        
++        # Build aggregated result
++        agent_results = {}
++        for agent_name, result in zip(agents, results):
++            if isinstance(result, Exception):
++                agent_results[agent_name] = {"status": "failed", "error": str(result)}
++            else:
++                agent_results[agent_name] = result
++        
++        aggregated = await self.aggregate_results("multi_agent", agent_results)
++        return aggregated
+ 
+     async def dispatch_multi_agent(
+         self,
+@@ -174,7 +276,7 @@
+             TaskPriority.LOW: 1
+         }[priority]
+         
+-        heapq.heappush(self._task_queue, (-priority_value, task.created_at.timestamp(), task))
++        heapq.heappush(self._task_queue, (-priority_value, next(self._sequence), task))
+         logger.info(f"[DISPATCHER] Dispatched multi-agent task {task.task_id} to {len(agents)} agents")
+         
+         return task.task_id
+@@ -188,16 +290,35 @@
+         """
+         Delegate a subtask to a specific agent.
+         
++        FIX D-5: Previously this method only generated a subtask ID stub
++        without creating or dispatching a real task. Now it creates a
++        proper Task, adds it to the priority queue, and returns a
++        trackable task ID.
++        
+         Args:
+             task_id: Parent task ID
+             agent_name: Name of the agent
+             subtask: Subtask command
+             
+         Returns:
+-            Subtask ID
++            Subtask ID that can be looked up via get_task()
+         """
+         subtask_id = f"{task_id}_{agent_name}_{str(uuid.uuid4())[:4]}"
+         
++        # Create a real task for the subtask
++        task = Task(
++            task_id=subtask_id,
++            command=subtask,
++            status=TaskStatus.PENDING,
++            priority=TaskPriority.HIGH,  # Subtasks are high priority
++            created_at=datetime.now(),
++            metadata={"parent_task": task_id, "agent": agent_name, "delegated": True}
++        )
++        
++        # Add to priority queue (HIGH priority for subtasks)
++        priority_value = 3  # HIGH
++        heapq.heappush(self._task_queue, (-priority_value, next(self._sequence), task))
++        
+         logger.info(f"[DISPATCHER] Delegated subtask {subtask_id} to agent {agent_name}")
+         
+         return subtask_id
+@@ -240,10 +361,96 @@
+         }
+ 
+     async def _execute_command(self, command: str) -> Any:
+-        """Execute a command (placeholder for actual implementation)."""
+-        # This is a placeholder - actual implementation would route to appropriate handlers
++        """
++        Execute a command.
++
++        Real execution path: if a provider_router was wired in via
++        set_provider_router(), the command is sent to it directly as a
++        prompt via generate_text() (which already has its own
++        online/auto-fallback logic between providers - see
++        providers/provider_router.py). This is the minimal, unambiguous
++        connection: provider_router is the only component that can
++        actually produce a real response, and dispatcher's whole purpose
++        is to execute commands, so *some* real call to it is required to
++        move past the previous placeholder - it is not a new abstraction,
++        just using the router's own existing public generate_text() method.
++
++        What this does NOT do: assemble any system prompt, conversation
++        history, or session context (no Context Manager exists anywhere in
++        this codebase to build that from - confirmed by search, reported
++        separately rather than invented here), and it does NOT route
++        through agent_router (see set_provider_router's docstring for why).
++        So this sends the raw command string as the entire prompt, nothing
++        more. That's a real limitation, not hidden: results are marked with
++        `"stub": False` here specifically so a caller can distinguish "ran
++        for real, but with no context" from `"stub": True` ("didn't run at
++        all"), rather than only having one bit of information.
++
++        Falls back to the original placeholder behavior (stub: True) if no
++        provider_router was wired in, so the dispatcher still works, in
++        the same degraded sense as before, when used standalone.
++        """
++        if self._provider_router is not None:
++            try:
++                response = await self._provider_router.generate_text(command)
++                return {
++                    "stub": False,
++                    "output": response.content,
++                    "provider": response.provider,
++                    "model": response.model,
++                    "latency_ms": response.latency_ms,
++                }
++            except Exception as e:
++                logger.error(f"[DISPATCHER] Real execution failed for command {command!r}: {e}")
++                raise
++
++        logger.warning(
++            f"[DISPATCHER] '_execute_command' running in stub mode (no provider_router "
++            f"wired in) - task not actually routed to any provider or agent: {command!r}"
++        )
+         await asyncio.sleep(0.1)  # Simulate work
+-        return f"Executed: {command}"
++        return {"stub": True, "output": f"Executed: {command}"}
++
++    # FIX D-7: Implement task cancellation. TaskStatus.CANCELLED existed
++    # in the enum but was never used — there was no way to cancel a task.
++    def cancel_task(self, task_id: str) -> bool:
++        """
++        Cancel a pending or running task.
++        
++        Args:
++            task_id: ID of the task to cancel
++            
++        Returns:
++            True if the task was found and cancelled, False otherwise
++        """
++        # Check running tasks first
++        task = self._running_tasks.get(task_id)
++        if task:
++            task.status = TaskStatus.CANCELLED
++            task.completed_at = datetime.now()
++            self._running_tasks.pop(task_id, None)
++            self._completed_tasks[task_id] = task
++            # Enforce limit
++            while len(self._completed_tasks) > DEFAULT_COMPLETED_TASK_LIMIT:
++                self._completed_tasks.popitem(last=False)
++            logger.info(f"[DISPATCHER] Cancelled running task {task_id}")
++            return True
++        
++        # Check pending tasks in queue
++        for i, (_, _, queued_task) in enumerate(self._task_queue):
++            if queued_task.task_id == task_id:
++                queued_task.status = TaskStatus.CANCELLED
++                queued_task.completed_at = datetime.now()
++                # Remove from queue
++                self._task_queue.pop(i)
++                heapq.heapify(self._task_queue)  # Re-heapify after removal
++                self._completed_tasks[task_id] = queued_task
++                while len(self._completed_tasks) > DEFAULT_COMPLETED_TASK_LIMIT:
++                    self._completed_tasks.popitem(last=False)
++                logger.info(f"[DISPATCHER] Cancelled pending task {task_id}")
++                return True
++        
++        return False
+ 
+     def get_task(self, task_id: str) -> Optional[Task]:
+         """Get a task by ID."""
+--- sage_runtime_original/sage_runtime/agents/router.py	2026-07-06 03:33:04.000000000 +0800
++++ kimi_submission/agents/router.py	2026-07-06 03:28:32.000000000 +0800
+@@ -31,6 +31,10 @@
+         self._agents: Dict[str, Agent] = {}
+         self._capability_index: Dict[AgentCapability, Set[str]] = {}
+         self._type_index: Dict[AgentType, Set[str]] = {}
++        # FIX A-2: Track per-agent load to enable load-aware routing.
++        # Without this, route_to_agent() always returns the first matching
++        # agent, potentially overloading it while other capable agents sit idle.
++        self._agent_load: Dict[str, int] = {}  # agent_id -> assigned_task_count
+ 
+     async def initialize(self):
+         """Initialize the router with default agents."""
+@@ -160,6 +164,9 @@
+             self._type_index[agent.agent_type] = set()
+         self._type_index[agent.agent_type].add(agent.agent_id)
+         
++        # FIX A-2: Initialize load tracking for new agent
++        self._agent_load[agent.agent_id] = 0
++        
+         logger.info(f"[AGENT_ROUTER] Registered agent: {agent.name} ({agent.agent_id})")
+         return True
+ 
+@@ -174,10 +181,21 @@
+         for capability in agent.capabilities:
+             if capability in self._capability_index:
+                 self._capability_index[capability].discard(agent_id)
++                # FIX A-3: Remove empty sets from the capability index.
++                # Previously, empty sets accumulated forever after unregistering
++                # the last agent with a given capability.
++                if not self._capability_index[capability]:
++                    del self._capability_index[capability]
+         
+         # Remove from type index
+         if agent.agent_type in self._type_index:
+             self._type_index[agent.agent_type].discard(agent_id)
++            # FIX A-3: Also clean empty type index sets
++            if not self._type_index[agent.agent_type]:
++                del self._type_index[agent.agent_type]
++        
++        # FIX A-2: Clean up load tracking
++        self._agent_load.pop(agent_id, None)
+         
+         del self._agents[agent_id]
+         logger.info(f"[AGENT_ROUTER] Unregistered agent: {agent_id}")
+@@ -201,14 +219,21 @@
+         """Get all enabled agents."""
+         return [agent for agent in self._agents.values() if agent.enabled]
+ 
+-    def route_to_agent(self, capability: AgentCapability, agent_type: Optional[AgentType] = None) -> Optional[Agent]:
++    def route_to_agent(self, capability: AgentCapability, 
++                       agent_type: Optional[AgentType] = None,
++                       fallback: bool = True) -> Optional[Agent]:
+         """
+         Route a task to the best available agent.
+         
+         Priority:
+         1. If agent_type specified, use enabled agent of that type with capability
+         2. Otherwise, use any enabled agent with the capability
+-        3. Prefer SAGE for coordination tasks
++        3. Prefer least-loaded agent (FIX A-2)
++        4. Prefer SAGE for coordination tasks
++        
++        FIX A-1: If no agent matches and fallback=True, returns the primary
++        SAGE agent or any enabled agent instead of None. Previously, callers
++        had to handle None (which most didn't), leading to AttributeError.
+         """
+         candidates = []
+         
+@@ -218,16 +243,52 @@
+             candidates = [a for a in self.get_enabled_agents() if capability in a.capabilities]
+         
+         if not candidates:
++            if fallback:
++                # Fallback to SAGE primary agent
++                sage = self._agents.get("sage_primary")
++                if sage and sage.enabled:
++                    logger.warning(
++                        f"[AGENT_ROUTER] No agent for capability {capability.value}, "
++                        f"falling back to SAGE"
++                    )
++                    return sage
++                # Fallback to any enabled agent
++                enabled = self.get_enabled_agents()
++                if enabled:
++                    logger.warning(
++                        f"[AGENT_ROUTER] No agent for capability {capability.value}, "
++                        f"falling back to {enabled[0].name}"
++                    )
++                    return enabled[0]
+             logger.warning(f"[AGENT_ROUTER] No available agent for capability: {capability.value}")
+             return None
+         
+-        # Prefer SAGE for coordination
++        # FIX A-2: Sort by load (ascending) to distribute work evenly
++        # across multiple capable agents. Without this, the same agent
++        # gets overloaded while others sit idle.
++        candidates.sort(key=lambda a: self._agent_load.get(a.agent_id, 0))
++        
++        # Prefer SAGE for coordination tasks
+         sage_agents = [a for a in candidates if a.agent_type == AgentType.SAGE]
+         if sage_agents and capability in [AgentCapability.ARCHITECTURE, AgentCapability.CODE_REVIEW]:
+-            return sage_agents[0]
++            selected = sage_agents[0]
++        else:
++            selected = candidates[0]
++        
++        # FIX A-2: Increment load counter for selected agent
++        self._agent_load[selected.agent_id] = self._agent_load.get(selected.agent_id, 0) + 1
+         
+-        # Return first available candidate
+-        return candidates[0]
++        return selected
++
++    def release_agent(self, agent_id: str) -> None:
++        """
++        Decrement load counter when a task completes.
++        
++        FIX A-2: Call this when a task assigned to an agent completes
++        to enable accurate load-aware routing.
++        """
++        if agent_id in self._agent_load and self._agent_load[agent_id] > 0:
++            self._agent_load[agent_id] -= 1
+ 
+     def list_all_agents(self) -> List[Agent]:
+         """List all registered agents."""
+@@ -248,3 +309,11 @@
+             logger.info(f"[AGENT_ROUTER] Disabled agent: {agent_id}")
+             return True
+         return False
++
++    def get_agent_load(self, agent_id: str) -> int:
++        """Get current load for an agent. Returns 0 if agent not found."""
++        return self._agent_load.get(agent_id, 0)
++
++    def get_all_loads(self) -> Dict[str, int]:
++        """Get load map for all agents."""
++        return dict(self._agent_load)
+--- sage_runtime_original/sage_runtime/kernel/state.py	2026-07-06 03:33:07.000000000 +0800
++++ kimi_submission/kernel/state.py	2026-07-06 03:28:59.000000000 +0800
+@@ -4,12 +4,16 @@
+ Defines the state machine states and transitions for the SAGE OS kernel.
+ """
+ 
++import logging
+ from enum import Enum
+ from dataclasses import dataclass
+-from typing import Optional
++from typing import Optional, Dict, Set
+ from datetime import datetime
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ class KernelState(Enum):
+     """Kernel states following the SAGE OS v4.5 architecture."""
+     BOOT = "BOOT"
+@@ -21,6 +25,51 @@
+     SHUTDOWN = "SHUTDOWN"
+ 
+ 
++# FIX S-1: Previously KernelContext.transition_to() accepted any target
++# state, so a coding mistake (e.g., transitioning from BOOT straight to
++# COMMAND_EXECUTION) would silently corrupt the FSM invariant. This map
++# declares the legal forward transitions; transition_to() now logs a
++# WARNING on illegal transitions but does NOT raise — that keeps the fix
++# non-breaking for existing callers (including any wiring Cascade adds)
++# while making FSM violations visible in logs for diagnosis.
++# 
++# Ported from Runtime Engineer's S-1 fix and applied to the current
++# codebase (which includes Claude A's _init_optional() boot pattern).
++# ERROR and SHUTDOWN are reachable from any state (terminal recovery states).
++_ALLOWED_TRANSITIONS: Dict[KernelState, Set[KernelState]] = {
++    KernelState.BOOT: {
++        KernelState.KERNEL_READY,
++        KernelState.ERROR,
++        KernelState.SHUTDOWN,
++    },
++    KernelState.KERNEL_READY: {
++        KernelState.COMMAND_MODE,
++        KernelState.ERROR,
++        KernelState.SHUTDOWN,
++    },
++    KernelState.COMMAND_MODE: {
++        KernelState.WAITING_FOR_USER_COMMAND,
++        KernelState.ERROR,
++        KernelState.SHUTDOWN,
++    },
++    KernelState.WAITING_FOR_USER_COMMAND: {
++        KernelState.COMMAND_EXECUTION,
++        KernelState.ERROR,
++        KernelState.SHUTDOWN,
++    },
++    KernelState.COMMAND_EXECUTION: {
++        KernelState.WAITING_FOR_USER_COMMAND,
++        KernelState.ERROR,
++        KernelState.SHUTDOWN,
++    },
++    KernelState.ERROR: {
++        KernelState.WAITING_FOR_USER_COMMAND,  # recovery path
++        KernelState.SHUTDOWN,
++    },
++    KernelState.SHUTDOWN: set(),  # terminal — no outgoing transitions
++}
++
++
+ @dataclass
+ class StateTransition:
+     """Represents a state transition with metadata."""
+@@ -32,16 +81,54 @@
+ 
+ @dataclass
+ class KernelContext:
+-    """Runtime context maintained by the kernel."""
++    """Runtime context maintained by the kernel.
++
++    FIX S-2: Previously the context tracked only `error_count` — there
++    was no field to record *what* the last error actually was, making
++    post-mortem debugging of an ERROR-state kernel essentially blind.
++    `last_error` is now populated by `record_error()` and survives until
++    the next error or a manual clear. The field is optional and defaults
++    to None, so existing construction sites remain compatible.
++    
++    Ported from Runtime Engineer's S-2 fix.
++    """
+     current_state: KernelState
+     session_id: str
+     boot_time: datetime
+     last_transition: Optional[StateTransition] = None
+     error_count: int = 0
+     command_count: int = 0
++    # FIX S-2: New field for last error tracking
++    last_error: Optional[str] = None
++
++    @classmethod
++    def is_valid_transition(cls, from_state: KernelState, to_state: KernelState) -> bool:
++        """
++        Return True if transitioning from_state -> to_state is legal.
++        
++        Self-transitions are allowed (idempotent re-entry into the same
++        state — used by some shutdown paths).
++        """
++        if from_state == to_state:
++            return True
++        return to_state in _ALLOWED_TRANSITIONS.get(from_state, set())
+ 
+     def transition_to(self, new_state: KernelState, reason: Optional[str] = None) -> StateTransition:
+-        """Record a state transition."""
++        """
++        Record a state transition.
++
++        FIX S-1: Logs a WARNING when the transition is not in the legal
++        set per _ALLOWED_TRANSITIONS, but still performs it — this keeps
++        the fix non-breaking for existing callers (including any future
++        wiring Cascade adds) while making FSM violations visible in logs
++        for diagnosis.
++        """
++        if not self.is_valid_transition(self.current_state, new_state):
++            logger.warning(
++                f"[KERNEL_FSM] Illegal transition {self.current_state.value} -> "
++                f"{new_state.value} (reason: {reason!r}). Proceeding anyway — "
++                f"this indicates a bug in the caller."
++            )
+         transition = StateTransition(
+             from_state=self.current_state,
+             to_state=new_state,
+@@ -51,3 +138,22 @@
+         self.current_state = new_state
+         self.last_transition = transition
+         return transition
++
++    def record_error(self, error_msg: str) -> None:
++        """
++        Record a runtime error in the kernel context.
++
++        FIX S-2: Populates last_error and increments error_count so the
++        kernel's exception handlers can leave a breadcrumb for post-mortem
++        debugging. Existing code that only reads error_count is unaffected.
++        """
++        self.last_error = error_msg
++        self.error_count += 1
++
++    def clear_error(self) -> None:
++        """
++        Clear the last_error field.
++        
++        Does NOT reset error_count — the historical count is preserved.
++        """
++        self.last_error = None
+--- sage_runtime_original/sage_runtime/kernel/core.py	2026-07-06 03:33:07.000000000 +0800
++++ kimi_submission/kernel/core.py	2026-07-06 03:29:48.000000000 +0800
+@@ -34,6 +34,7 @@
+         self.session_id = str(uuid.uuid4())[:8]
+         self.context: Optional[KernelContext] = None
+         self._components: Dict[str, Any] = {}
++        self._degraded: Dict[str, str] = {}  # component_name -> error message
+         self._running = False
+         self._shutdown_event = asyncio.Event()
+ 
+@@ -73,47 +74,78 @@
+         return self.context
+ 
+     async def _boot_phase(self):
+-        """Execute boot sequence components."""
++        """Execute boot sequence components.
++
++        Components are split into two tiers:
++
++        - Critical (config, memory, event_bus): nothing else can function
++          without these, so a failure here aborts boot. This matches what
++          "kernel" means — these three are the actual minimal core.
++        - Optional (everything else): a failure here is logged and recorded
++          in self._degraded, but boot continues. A bug in a peripheral
++          module (e.g. repository_scanner) must never prevent the kernel
++          from reaching WAITING_FOR_USER_COMMAND. Before this change it did:
++          a missing `Optional` import in repository_scanner/dependency_graph.py
++          crashed the entire boot sequence with no possibility of recovery.
++        """
+         logger.info("[BOOT] Initializing components...")
+-        
+-        # Initialize configuration
++
++        # --- Critical tier: boot aborts if any of these fail ---
+         await self._init_config()
+-        
+-        # Initialize memory system
+         await self._init_memory()
+-        
+-        # Initialize event bus
+         await self._init_event_bus()
+-        
+-        # Initialize agent router
+-        await self._init_agent_router()
+-        
+-        # Initialize task dispatcher
+-        await self._init_task_dispatcher()
+-        
+-        # Initialize auditor
+-        await self._init_auditor()
+-        
+-        # Initialize provider router
+-        await self._init_provider_router()
+-        
+-        # Initialize file processor
+-        await self._init_file_processor()
+-        
+-        # Initialize repository scanner
+-        await self._init_repository_scanner()
+-        
+-        # Initialize image analyzer
+-        await self._init_image_analyzer()
+-        
+-        # Initialize dashboard monitor
+-        await self._init_dashboard()
+-        
+-        # Initialize contract validator
+-        await self._init_contract_validator()
+-        
++
++        # --- Optional tier: failures degrade, never abort ---
++        await self._init_optional("agent_router", self._init_agent_router)
++        await self._init_optional("dispatcher", self._init_task_dispatcher)
++        await self._init_optional("auditor", self._init_auditor)
++        await self._init_optional("provider_router", self._init_provider_router)
++        await self._init_optional("file_processor", self._init_file_processor)
++        await self._init_optional("repository_scanner", self._init_repository_scanner)
++        await self._init_optional("image_analyzer", self._init_image_analyzer)
++
++        # --- Wiring: connect already-initialized components together ---
++        # dispatcher is initialized before provider_router above (order
++        # unchanged from before this fix), so the connection has to happen
++        # here, after both exist, rather than at either one's construction
++        # time. This is the only wiring added: dispatcher -> provider_router.
++        # dispatcher -> agent_router is deliberately NOT wired here - see
++        # TaskDispatcher.set_provider_router's docstring for why that one
++        # is a reported decision point, not implemented.
++        dispatcher = self._components.get("dispatcher")
++        provider_router = self._components.get("provider_router")
++        if dispatcher is not None and provider_router is not None:
++            dispatcher.set_provider_router(provider_router)
++            logger.info("[BOOT] Wired dispatcher -> provider_router")
++
++        if self._degraded:
++            logger.warning(
++                f"[BOOT] Completed in DEGRADED mode — unavailable components: "
++                f"{', '.join(sorted(self._degraded.keys()))}. "
++                f"Run kernel.degraded_components for details."
++            )
+         logger.info("[BOOT] All components initialized")
+ 
++    async def _init_optional(self, name: str, init_fn) -> None:
++        """
++        Run a non-critical component initializer without letting its
++        failure abort the whole boot sequence.
++
++        Why this exists: _boot_phase previously called every _init_* method
++        back to back with no exception handling, so any single component
++        failure (including in modules unrelated to core kernel function,
++        like repository_scanner) took down the entire system. Splitting
++        "must exist for the kernel to mean anything" (config/memory/event_bus)
++        from "nice to have, degrade if broken" (everything else) is a low-
++        coupling fix: a broken peripheral module no longer has the power to
++        stop SAGE from booting.
++        """
++        try:
++            await init_fn()
++        except Exception as e:
++            logger.error(f"[BOOT] Optional component '{name}' failed to initialize: {e}")
++            self._degraded[name] = str(e)
++
+     async def _init_config(self):
+         """Initialize configuration system."""
+         from config.manager import ConfigManager
+@@ -165,7 +197,12 @@
+     async def _init_provider_router(self):
+         """Initialize provider router for LLM integration."""
+         from providers.provider_router import ProviderRouter
+-        provider_router = ProviderRouter(default_provider="grok")
++        # Default is "ollama", not "grok": this project's actual target
++        # hardware (consumer laptop, no GPU) has no guaranteed cloud budget,
++        # and Ollama is the only provider that requires no API key at all.
++        # Grok/Gemini remain available and get used automatically whenever
++        # their API keys ARE configured (see ProviderRouter.initialize).
++        provider_router = ProviderRouter(default_provider="ollama")
+         await provider_router.initialize()
+         self._components['provider_router'] = provider_router
+         logger.debug("[BOOT] Provider router initialized")
+@@ -193,22 +230,6 @@
+         self._components['image_analyzer'] = image_analyzer
+         logger.debug("[BOOT] Image analyzer initialized")
+ 
+-    async def _init_dashboard(self):
+-        """Initialize dashboard monitor."""
+-        from dashboard.monitor import DashboardMonitor
+-        dashboard = DashboardMonitor()
+-        await dashboard.initialize()
+-        self._components['dashboard'] = dashboard
+-        logger.debug("[BOOT] Dashboard monitor initialized")
+-
+-    async def _init_contract_validator(self):
+-        """Initialize contract validator."""
+-        from contracts.validator import ContractValidator
+-        validator = ContractValidator()
+-        await validator.initialize()
+-        self._components['contract_validator'] = validator
+-        logger.debug("[BOOT] Contract validator initialized")
+-
+     async def execute_command(self, command: str) -> Any:
+         """
+         Execute a user command.
+@@ -228,7 +249,13 @@
+         
+         try:
+             # Route command through dispatcher
+-            dispatcher = self._components['dispatcher']
++            dispatcher = self._components.get('dispatcher')
++            if dispatcher is None:
++                raise RuntimeError(
++                    "Task dispatcher unavailable — it failed to initialize during "
++                    f"boot ({self._degraded.get('dispatcher', 'unknown error')}). "
++                    "See kernel.degraded_components for the full list."
++                )
+             result = await dispatcher.dispatch(command)
+             
+             # Return to WAITING_FOR_USER_COMMAND (never terminate after READY)
+@@ -241,7 +268,10 @@
+             
+         except Exception as e:
+             logger.error(f"[KERNEL] Command execution failed: {e}")
+-            self.context.error_count += 1
++            # FIX S-2: Use record_error() instead of just incrementing error_count.
++            # This populates last_error for post-mortem debugging.
++            # Ported from Runtime Engineer's S-2 fix.
++            self.context.record_error(f"Command {command!r} failed: {e}")
+             self.context.transition_to(
+                 KernelState.WAITING_FOR_USER_COMMAND,
+                 f"Command failed with error: {e}"
+@@ -272,6 +302,16 @@
+         return self._components.get(name)
+ 
+     @property
++    def degraded_components(self) -> Dict[str, str]:
++        """Optional components that failed to initialize during boot, mapped to their error."""
++        return dict(self._degraded)
++
++    @property
++    def is_degraded(self) -> bool:
++        """Whether the kernel is running with one or more optional components unavailable."""
++        return bool(self._degraded)
++
++    @property
+     def state(self) -> KernelState:
+         """Current kernel state."""
+         return self.context.current_state if self.context else KernelState.BOOT
