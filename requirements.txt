@@ -1,42 +1,18 @@
-# SAGE Runtime - Dependencies
-# Python 3.10+ required
+# SAGE OS v4.5 Runtime Dependencies
 
 # Core dependencies
-typing-extensions>=4.0.0
+psutil>=5.9.0  # For system monitoring in dashboard
 
-# Async support
-asyncio-compat>=0.1.0
+# Web interface dependencies
+fastapi>=0.100.0  # Web API framework
+uvicorn>=0.23.0  # ASGI server
+websockets>=11.0  # WebSocket support
 
-# Logging and monitoring
-structlog>=23.0.0
+# LLM Provider dependencies
+openai>=1.0.0  # For Grok API (uses OpenAI-compatible interface)
+google-generativeai>=0.3.0  # For Gemini API
 
-# Configuration management
-pyyaml>=6.0
-python-dotenv>=1.0.0
-
-# File processing
-chardet>=5.0.0
-magic-python>=1.0.0
-
-# Image analysis (optional)
-Pillow>=10.0.0
-pytesseract>=0.3.10
-
-# Web interface (optional)
-flask>=3.0.0
-flask-cors>=4.0.0
-
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.1.0
-
-# Development
-black>=23.0.0
-flake8>=6.0.0
-mypy>=1.0.0
-isort>=5.12.0
-
-# Utilities
-psutil>=5.9.0
-aiofiles>=23.0.0
+# File processing dependencies
+PyPDF2>=3.0.0  # PDF parsing
+python-docx>=1.0.0  # DOCX parsing
+Pillow>=10.0.0  # Image processing
